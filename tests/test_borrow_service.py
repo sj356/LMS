@@ -65,8 +65,8 @@ class BorrowServiceTest(unittest.TestCase):
         result = self.service.check("R2001", "B0002")
         self.assertFalse(result.ok)
         self.assertEqual(result.code, "HAS_OVERDUE")
-        self.assertIn("1 册图书超期", result.message)
-        self.assertIn("10 天", result.message)
+        self.assertIn("1 册图书超期超过宽限期 7 天", result.message)
+        self.assertIn("最长超期 10 天", result.message)
 
     def test_tc06_lost_card_rejected(self):
         self.repo.get_reader("R2001").status = ReaderStatus.LOST
@@ -142,6 +142,31 @@ class BorrowServiceTest(unittest.TestCase):
         self.assertEqual(outcome.loans, [])
         self.assertEqual(len(self.repo.active_loans_of("R2001")), 4)
         self.assertEqual(self.repo.get_copy("B0005").status, CopyStatus.AVAILABLE)
+
+    def test_tc17_overdue_within_grace_allows_borrowing_with_notice(self):
+        outcome = self.borrow_ok("R2001", ["B0001"])
+        outcome.loans[0].due_date = date(2026, 11, 7)
+        result = self.service.check("R2001", "B0002")
+        self.assertTrue(result.ok, result.message)
+        self.assertIn("最长 3 天", result.message)
+        self.assertIn("尚在 7 天宽限期内", result.message)
+        self.borrow_ok("R2001", ["B0002"])
+
+    def test_tc18_grace_boundary_seven_days_is_allowed(self):
+        outcome = self.borrow_ok("R2001", ["B0001"])
+        outcome.loans[0].due_date = date(2026, 11, 3)
+        result = self.service.check("R2001", "B0002")
+        self.assertTrue(result.ok, result.message)
+        self.assertIn("最长 7 天", result.message)
+
+    def test_tc19_overdue_beyond_grace_is_rejected(self):
+        outcome = self.borrow_ok("R2001", ["B0001"])
+        outcome.loans[0].due_date = date(2026, 11, 2)
+        result = self.service.check("R2001", "B0002")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "HAS_OVERDUE")
+        self.assertIn("超过宽限期 7 天", result.message)
+        self.assertIn("最长超期 8 天", result.message)
 
 
 if __name__ == "__main__":
