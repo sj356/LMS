@@ -10,6 +10,7 @@ class BorrowRule:
     renew_times: int
     renew_days: int
     max_reservations: int
+    overdue_grace_days: int = 7
 
 
 DEFAULT_RULES = {

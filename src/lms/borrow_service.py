@@ -61,13 +61,16 @@ class BorrowService:
             )
 
         overdue = self.repo.overdue_loans_of(reader_id, self.today)
-        if overdue:
-            longest = max(x.overdue_days(self.today) for x in overdue)
+        blocking = [x for x in overdue if x.overdue_days(self.today) > rule.overdue_grace_days]
+        if blocking:
+            longest = max(x.overdue_days(self.today) for x in blocking)
             return EligibilityResult(
                 False,
                 "HAS_OVERDUE",
-                f"当前有 {len(overdue)} 册图书超期未还（最长超期 {longest} 天），请先归还后再借。",
-                {"overdue_count": len(overdue), "max_days": longest},
+                f"当前有 {len(blocking)} 册图书超期超过宽限期 {rule.overdue_grace_days} 天"
+                f"（最长超期 {longest} 天），请先归还后再借。",
+                {"overdue_count": len(blocking), "max_days": longest,
+                 "grace_days": rule.overdue_grace_days},
             )
 
         copy = self.repo.get_copy(barcode)
@@ -82,12 +85,18 @@ class BorrowService:
         if copy.status is CopyStatus.DISCARDED:
             return EligibilityResult(False, "COPY_DISCARDED", f"《{copy.title}》（{barcode}）已注销，不可借阅。")
 
+        notice = ""
+        if overdue:
+            longest = max(x.overdue_days(self.today) for x in overdue)
+            notice = (f"另有 {len(overdue)} 册图书已超期（最长 {longest} 天），"
+                      f"尚在 {rule.overdue_grace_days} 天宽限期内，请尽快归还。")
+
         return EligibilityResult(
             True,
             "OK",
             f"校验通过，可借 {max(rule.max_books - held - 1, 0)} 册，应于 "
-            f"{(self.today + timedelta(days=rule.loan_days)).isoformat()} 前归还。",
-            {"rule": rule, "current": len(active)},
+            f"{(self.today + timedelta(days=rule.loan_days)).isoformat()} 前归还。{notice}",
+            {"rule": rule, "current": len(active), "grace_overdue": len(overdue)},
         )
 
     def borrow(self, reader_id: str, barcodes: list[str]) -> BorrowOutcome:
