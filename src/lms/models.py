@@ -50,6 +50,7 @@ class Loan:
     borrow_date: date
     due_date: date
     return_date: date | None = None
+    title: str = ""
 
     @property
     def is_returned(self) -> bool:

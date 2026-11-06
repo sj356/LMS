@@ -8,6 +8,7 @@ from .rules import DEFAULT_RULES, BorrowRule
 
 @dataclass
 class BorrowOutcome:
+    reader: Reader | None = None
     loans: list[Loan] = field(default_factory=list)
     rejections: list[tuple[str, EligibilityResult]] = field(default_factory=list)
 
@@ -15,12 +16,13 @@ class BorrowOutcome:
     def receipt(self) -> str:
         if not self.loans:
             return ""
-        first = self.loans[0]
         lines = ["借阅凭条"]
+        if self.reader is not None:
+            lines.append(f"读者：{self.reader.name}（{self.reader.reader_id}，{self.reader.reader_type.value}）")
         lines.append(f"借出册数：{len(self.loans)} 册")
         for loan in self.loans:
-            lines.append(f"  {loan.barcode}  应还日期 {loan.due_date.isoformat()}")
-        lines.append(f"借阅日期：{first.borrow_date.isoformat()}")
+            lines.append(f"  《{loan.title}》 {loan.barcode}  应还日期 {loan.due_date.isoformat()}")
+        lines.append(f"借阅日期：{self.loans[0].borrow_date.isoformat()}")
         return "\n".join(lines)
 
 
@@ -33,7 +35,7 @@ class BorrowService:
     def rule_of(self, reader: Reader) -> BorrowRule:
         return self.rules[reader.reader_type]
 
-    def check(self, reader_id: str, barcode: str) -> EligibilityResult:
+    def check(self, reader_id: str, barcode: str, extra_borrowed: int = 0) -> EligibilityResult:
         reader = self.repo.get_reader(reader_id)
         if reader is None:
             return EligibilityResult(False, "READER_NOT_FOUND", f"读者证号 {reader_id} 不存在，请核对后重新扫描。")
@@ -47,6 +49,17 @@ class BorrowService:
             return EligibilityResult(False, "READER_FROZEN", f"读者证已冻结（{reason}），请先处理后再借。")
 
         rule = self.rule_of(reader)
+        active = self.repo.active_loans_of(reader_id)
+        held = len(active) + extra_borrowed
+        if held >= rule.max_books:
+            return EligibilityResult(
+                False,
+                "OVER_LIMIT",
+                f"{reader.reader_type.value}借阅上限 {rule.max_books} 册，当前已借 {len(active)} 册，"
+                f"还可借 {max(rule.max_books - held, 0)} 册；请先归还图书后再借。",
+                {"limit": rule.max_books, "current": len(active), "requested": extra_borrowed + 1},
+            )
+
         overdue = self.repo.overdue_loans_of(reader_id, self.today)
         if overdue:
             longest = max(x.overdue_days(self.today) for x in overdue)
@@ -55,16 +68,6 @@ class BorrowService:
                 "HAS_OVERDUE",
                 f"当前有 {len(overdue)} 册图书超期未还（最长超期 {longest} 天），请先归还后再借。",
                 {"overdue_count": len(overdue), "max_days": longest},
-            )
-
-        active = self.repo.active_loans_of(reader_id)
-        if len(active) >= rule.max_books:
-            return EligibilityResult(
-                False,
-                "OVER_LIMIT",
-                f"{reader.reader_type.value}借阅上限 {rule.max_books} 册，当前已借 {len(active)} 册，"
-                f"还可借 {max(rule.max_books - len(active), 0)} 册；请先归还图书后再借。",
-                {"limit": rule.max_books, "current": len(active)},
             )
 
         copy = self.repo.get_copy(barcode)
@@ -82,28 +85,51 @@ class BorrowService:
         return EligibilityResult(
             True,
             "OK",
-            f"校验通过，可借 {max(rule.max_books - len(active), 0)} 册，应于 "
+            f"校验通过，可借 {max(rule.max_books - held - 1, 0)} 册，应于 "
             f"{(self.today + timedelta(days=rule.loan_days)).isoformat()} 前归还。",
             {"rule": rule, "current": len(active)},
         )
 
     def borrow(self, reader_id: str, barcodes: list[str]) -> BorrowOutcome:
-        outcome = BorrowOutcome()
+        outcome = BorrowOutcome(reader=self.repo.get_reader(reader_id))
+        if not barcodes:
+            return outcome
+
+        staged: list[str] = []
         for barcode in barcodes:
-            result = self.check(reader_id, barcode)
+            if barcode in staged:
+                result = EligibilityResult(False, "DUPLICATE_SCAN", f"条码 {barcode} 在本次借阅中重复扫描，请核对。")
+            else:
+                result = self.check(reader_id, barcode, extra_borrowed=len(staged))
             if not result.ok:
+                self._log(reader_id, barcode, result)
                 outcome.rejections.append((barcode, result))
-                continue
+                return outcome
+            staged.append(barcode)
+
+        rule = self.rule_of(outcome.reader)
+        for barcode in staged:
             copy = self.repo.get_copy(barcode)
-            rule = self.rule_of(self.repo.get_reader(reader_id))
             loan = Loan(
                 loan_id=self.repo.next_loan_id(),
                 reader_id=reader_id,
                 barcode=barcode,
                 borrow_date=self.today,
                 due_date=self.today + timedelta(days=rule.loan_days),
+                title=copy.title,
             )
             self.repo.save_loan(loan)
             copy.status = CopyStatus.BORROWED
             outcome.loans.append(loan)
         return outcome
+
+    def _log(self, reader_id: str, barcode: str, result: EligibilityResult) -> None:
+        self.repo.add_log(
+            {
+                "at": self.today.isoformat(),
+                "reader_id": reader_id,
+                "barcode": barcode,
+                "code": result.code,
+                "message": result.message,
+            }
+        )
